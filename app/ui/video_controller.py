@@ -20,6 +20,10 @@ SEEK_SETTLE_SECONDS = 3
 NUDGE_DEADBAND_MS = 150
 NUDGE_STEPS = (0.92, 0.96, 1.0, 1.04, 1.08)
 RATE_CHANGE_SECONDS = 1.0
+# A video nobody watches (app minimized/hidden) or that stands still (music paused) is unloaded after a while:
+# a 1080p decoder holds a lot of memory. The last frame stays on screen and it loads again on play.
+UNLOAD_SUSPENDED_SECONDS = 45
+UNLOAD_PAUSED_SECONDS = 120
 
 
 def isRemote(path):
@@ -60,17 +64,50 @@ class VideoController(QObject):
         self.syncTimer.setInterval(200)
         self.syncTimer.timeout.connect(self.sync)
         self.videoTint = None
+        self.unloaded = False
+        self.idleSince = None
+        self.tintImage = None
         self.tintTimer = QTimer(self)
         self.tintTimer.setInterval(1000)
         self.tintTimer.timeout.connect(self._sampleTint)
         self.tintTimer.start()
 
     def _sampleTint(self):
+        self._checkIdle()
         wanted = settings.get("songColorSource") == "video" and self.hasFrames()
+        if wanted and self.currentImage is self.tintImage:
+            return
+        self.tintImage = self.currentImage if wanted else None
         color = dominantColorOfImage(self.currentImage) if wanted else None
         if color != self.videoTint:
             self.videoTint = color
             self.tintChanged.emit(color)
+
+    def _checkIdle(self):
+        if not self.currentPath or self.unloaded or self.failed:
+            self.idleSince = None
+            return
+        idle = self.suspended or not self.player.isPlaying()
+        if not idle:
+            self.idleSince = None
+            return
+        now = time.monotonic()
+        if self.idleSince is None:
+            self.idleSince = now
+            return
+        limit = UNLOAD_SUSPENDED_SECONDS if self.suspended else UNLOAD_PAUSED_SECONDS
+        if now - self.idleSince >= limit:
+            self.unloaded = True
+            self.idleSince = None
+            self.mediaPlayer.stop()
+            self.mediaPlayer.setSource(QUrl())
+            print("[Video] fermo da un po': scaricato per liberare memoria")
+
+    def _reloadIfUnloaded(self):
+        if self.unloaded and self.currentPath:
+            self.unloaded = False
+            self.retried = False
+            self._setSource(self.currentPath)
 
     # ---------- clients ----------
     def request(self, client, path):
@@ -94,6 +131,8 @@ class VideoController(QObject):
             return
         self.currentPath = wantedPath
         self.currentImage = None
+        self.unloaded = False
+        self.idleSince = None
         self.failed = False
         self.retried = False
         self.mediaPlayer.stop()
@@ -172,6 +211,10 @@ class VideoController(QObject):
         if not self.currentPath or self.suspended or self.failed:
             return
         audioPlaying = self.player.isPlaying()
+        if self.unloaded:
+            if not audioPlaying:
+                return
+            self._reloadIfUnloaded()
         now = time.monotonic()
         if audioPlaying and not self.audioWasPlaying:
             self.loadedAt = now

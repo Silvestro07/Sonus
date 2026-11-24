@@ -13,8 +13,12 @@ from .room_files import RoomFileCache, encryptFile, uploadTemporary, validRoomFi
 from .workers import runInBackground
 from .session_link import Link, makeCode
 from .together_sync import ClockSync, expectedPosition, isNewer, nowMs, trackFromSong
+from . import voice_sync
 
 DRIFT_TOLERANCE_MS = 700
+# After "Sincronizza voci" the songs are kept much closer (small jumps are fine when you sing together)
+PRECISE_DRIFT_TOLERANCE_MS = 120
+PRECISE_PING_MS = 5000
 ROOM_FILE_WAIT_SECONDS = 20
 FILE_ID_CACHE_SECONDS = 120
 REUPLOAD_AFTER_SECONDS = 50 * 60
@@ -75,6 +79,7 @@ class TogetherController(QObject):
     peersChanged = Signal()
     connectionChanged = Signal(bool)
     effectsChanged = Signal(object)
+    voiceSyncChanged = Signal(object)  # the current voice synchronization (dict) or None
 
     def __init__(self, player, database, songEffects, notify=None, clientId=None, profile=None, parent=None):
         super().__init__(parent)
@@ -101,6 +106,10 @@ class TogetherController(QObject):
         self.recovery = None
         self.anchorKey = None
         self.coverRequests = set()
+        self.voiceSync = None
+        self.voiceSyncTimer = QTimer(self)
+        self.voiceSyncTimer.setSingleShot(True)
+        self.voiceSyncTimer.timeout.connect(self._finishVoiceSyncTaps)
 
         self.publishTimer = QTimer(self)
         self.publishTimer.setSingleShot(True)
@@ -129,6 +138,7 @@ class TogetherController(QObject):
         self.fileTimer.start()
         player.roomFileResolver = self.resolveRoomFile
         player.startPositionResolver = self._startPositionFor
+
         from PySide6.QtCore import QThreadPool
         self.uploadPool = QThreadPool(self)
         self.uploadPool.setMaxThreadCount(2)
@@ -178,6 +188,8 @@ class TogetherController(QObject):
         self.joinedAt = nowMs()
         self.waitingForState = waitForState
         self.player.skipOnError = False
+        # In a room a long pause must not unload the song: the others can press play at any moment
+        self.player.keepLoaded = True
         self.link.watch(code, ["#"])  # one subscription: the server allows 10 per connection
         self.link.setWill(code, f"presence/{self.myId()}")
         self._publishPresence()
@@ -188,6 +200,7 @@ class TogetherController(QObject):
         if waitForState:
             self.waitTimer.start(STATE_WAIT_MS)
         self.driftTimer.start()
+        self.pingTimer.setInterval(PRECISE_PING_MS if self.preciseSync() else 20000)
         self.pingTimer.start()
         self.roomChanged.emit()
         self.peersChanged.emit()
@@ -210,6 +223,8 @@ class TogetherController(QObject):
         self.driftTimer.stop()
         self.pingTimer.stop()
         self.waitTimer.stop()
+        self.cancelVoiceSync(notifyPartner=True)
+        self.player.keepLoaded = False
         self.publishTimer.stop()
         self.anchorKey = None
         hadRoomEffects = self.roomEffects is not None
@@ -472,7 +487,7 @@ class TogetherController(QObject):
                     self.player.mediaPlayer.pause()
                 self.player.mediaPlayer.setPosition(0)
                 return
-            if abs(self.player.position() - expected) > DRIFT_TOLERANCE_MS:
+            if abs(self.player.position() - expected) > self.driftTolerance():
                 self.player.mediaPlayer.setPosition(expected)
             if state.get("playing") and not self.player.isPlaying():
                 self.player.mediaPlayer.play()
@@ -551,14 +566,14 @@ class TogetherController(QObject):
             if expected < 0:
                 if self.player.isPlaying():
                     self.player.mediaPlayer.pause()
-                if self.player.position() > DRIFT_TOLERANCE_MS:
+                if self.player.position() > self.driftTolerance():
                     self.player.mediaPlayer.setPosition(0)
                 return
             if state.get("playing") and not self.player.isPlaying():
                 duration = self.player.duration()
                 if not duration or expected < duration - 1500:
                     self.player.mediaPlayer.play()
-            if abs(self.player.position() - expected) > DRIFT_TOLERANCE_MS and (state.get("playing") or not self.player.isPlaying()):
+            if abs(self.player.position() - expected) > self.driftTolerance() and (state.get("playing") or not self.player.isPlaying()):
                 self.player.mediaPlayer.setPosition(expected)
         finally:
             self.applying -= 1
@@ -638,6 +653,9 @@ class TogetherController(QObject):
 
     def _onMessage(self, message):
         if message.get("to") != self.myId():
+            return
+        if str(message.get("type") or "").startswith("vsync_"):
+            self._onVoiceSyncMessage(message)
             return
         if message.get("type") == "ping":
             self.link.publish(self.code, "msg", {"type": "pong", "from": self.myId(), "to": message.get("from"),
@@ -771,6 +789,169 @@ class TogetherController(QObject):
     def _targetPosition(self, state):
         """Where MY player should be: the room position minus my delay (negative = not started yet for me)."""
         return expectedPosition(state, nowMs(), self.clock.offset(state.get("by"))) - self.delayMs()
+
+    def preciseSync(self):
+        return bool(settings.get("roomPreciseSync"))
+
+    def setPreciseSync(self, enabled):
+        settings.set("roomPreciseSync", bool(enabled))
+        settings.save()
+        self.pingTimer.setInterval(PRECISE_PING_MS if enabled else 20000)
+        if self.code:
+            self._pingAll()
+            QTimer.singleShot(0, self._checkDrift)
+
+    def driftTolerance(self):
+        return PRECISE_DRIFT_TOLERANCE_MS if self.preciseSync() else DRIFT_TOLERANCE_MS
+
+    # ---------- voice synchronizer ----------
+    def startVoiceSync(self, peerId):
+        """Starts "Sincronizza voci" with a friend in the room (see voice_sync.py for the method)."""
+        if not self.code or peerId not in self.peers or peerId == self.myId():
+            return False
+        self.cancelVoiceSync(notifyPartner=True)
+        session = voice_sync.newSession()
+        plan = voice_sync.makePlan(self.myId(), peerId, nowMs() + voice_sync.COUNTDOWN_MS)
+        self.link.publish(self.code, "msg", {"type": "vsync_invite", "from": self.myId(), "to": peerId,
+                                             "session": session, "plan": plan})
+        self._ping(peerId)
+        self._beginVoiceSync(session, peerId, plan, 0)
+        return True
+
+    def _beginVoiceSync(self, session, partnerId, plan, offsetMs):
+        local = voice_sync.planInMyClock(plan, offsetMs)
+        phases = []
+        cueTimes, accents = [], []
+        for phase in local["phases"]:
+            role = voice_sync.myRole(phase, self.myId())
+            phases.append(dict(phase, role=role))
+            if role in ("click", "sing"):
+                cueTimes += [beat / 1000 for beat in phase["beats"]]
+                accents += [index == 0 for index in range(len(phase["beats"]))]
+        partnerName = (self.peers.get(partnerId) or {}).get("name") or "Amico"
+        self.voiceSync = {"session": session, "partner": partnerId, "partnerName": partnerName,
+                          "initiator": plan["initiator"] == self.myId(), "beatMs": plan["beatMs"], "phases": phases,
+                          "taps": [], "status": "running", "myNeed": None, "theirNeed": None, "error": None,
+                          "applied": None}
+        self.player.mediaPlayer.clearCues()
+        if not self.player.mediaPlayer.scheduleCues(cueTimes, accents):
+            self.voiceSync["status"] = "failed"
+            self.voiceSync["error"] = "La scheda audio non è disponibile"
+        else:
+            end = phases[-1]["beats"][-1] + plan["beatMs"] + 600
+            self.voiceSyncTimer.start(max(0, int(end - nowMs())))
+        self.voiceSyncChanged.emit(dict(self.voiceSync))
+
+    def voiceSyncTap(self, atMs=None):
+        if self.voiceSync and self.voiceSync["status"] == "running":
+            self.voiceSync["taps"].append(int(atMs if atMs is not None else nowMs()))
+
+    def _finishVoiceSyncTaps(self):
+        sync = self.voiceSync
+        if not sync or sync["status"] != "running":
+            return
+        taps = sync["taps"]
+        calibration = next(phase for phase in sync["phases"] if phase["role"] == "click")
+        listening = next(phase for phase in sync["phases"] if phase["role"] == "listen")
+        bias, biasError = voice_sync.measure(taps, calibration["beats"], sync["beatMs"])
+        heard, heardError = voice_sync.measure(taps, listening["beats"], sync["beatMs"])
+        error = None
+        if biasError:
+            error = f"Prova: {biasError}"
+        elif heardError:
+            error = f"Turno di {sync['partnerName']}: {heardError}"
+        sync["myNeed"] = None if error else int(round(voice_sync.listenDelay(heard, bias)))
+        sync["bias"] = bias
+        sync["heard"] = heard
+        sync["status"] = "failed" if error else "waiting"
+        sync["error"] = error
+        print(f"[Voci] misura: bias={bias} sentito={heard} serve={sync['myNeed']} {error or ''}")
+        if self.code:
+            self.link.publish(self.code, "msg", {"type": "vsync_result", "from": self.myId(), "to": sync["partner"],
+                                                 "session": sync["session"], "need": sync["myNeed"], "error": error})
+        self._voiceSyncMaybeDone()
+
+    def _voiceSyncMaybeDone(self):
+        sync = self.voiceSync
+        if sync and sync["status"] == "waiting" and sync["theirNeed"] is not None:
+            sync["status"] = "done"
+        self.voiceSyncChanged.emit(dict(sync) if sync else None)
+
+    def applyVoiceSync(self, mode):
+        """Applies the chosen result to both: personal delays + precise room sync."""
+        sync = self.voiceSync
+        if not sync or sync["status"] != "done":
+            return None
+        mine, theirs = voice_sync.delaysFor(mode, sync["myNeed"], sync["theirNeed"])
+        if self.code:
+            self.link.publish(self.code, "msg", {"type": "vsync_apply", "from": self.myId(), "to": sync["partner"],
+                                                 "session": sync["session"], "delay": theirs, "mode": mode})
+        self._applyVoiceDelay(mine, mode)
+        return mine, theirs
+
+    def _applyVoiceDelay(self, delayMs, mode):
+        sync = self.voiceSync
+        self.setDelay(delayMs)
+        self.setPreciseSync(True)
+        if sync:
+            sync["applied"] = {"mode": mode, "delay": int(delayMs)}
+            sync["status"] = "applied"
+            self.voiceSyncChanged.emit(dict(sync))
+        self.notify("Voci sincronizzate: il tuo ritardo ora è " + (f"+{delayMs / 1000:.2f} s" if delayMs else "zero"))
+
+    def cancelVoiceSync(self, notifyPartner=False):
+        sync = self.voiceSync
+        if sync is None:
+            return
+        self.voiceSyncTimer.stop()
+        self.player.mediaPlayer.clearCues()
+        if notifyPartner and sync["status"] in ("running", "waiting", "done") and self.code:
+            self.link.publish(self.code, "msg", {"type": "vsync_cancel", "from": self.myId(), "to": sync["partner"],
+                                                 "session": sync["session"]})
+        self.voiceSync = None
+        self.voiceSyncChanged.emit(None)
+
+    def _onVoiceSyncMessage(self, message):
+        kind = message.get("type")
+        sender = message.get("from")
+        sync = self.voiceSync
+        if kind == "vsync_invite":
+            plan = message.get("plan")
+            if not isinstance(plan, dict) or not isinstance(plan.get("phases"), list) or plan.get("partner") != self.myId():
+                return
+            try:
+                if sync is not None:
+                    self.cancelVoiceSync()
+                self._beginVoiceSync(str(message.get("session")), sender, plan, self.clock.offset(sender))
+            except (KeyError, TypeError, ValueError, StopIteration):
+                return
+            self.notify(f"{(self.peers.get(sender) or {}).get('name') or 'Un amico'} vuole sincronizzare le voci")
+            return
+        if not sync or message.get("session") != sync["session"] or sender != sync["partner"]:
+            return
+        if kind == "vsync_result":
+            if message.get("error") or message.get("need") is None:
+                sync["status"] = "failed"
+                sync["error"] = f"{sync['partnerName']}: {message.get('error') or 'misura non riuscita'}"
+                self.voiceSyncChanged.emit(dict(sync))
+                return
+            try:
+                sync["theirNeed"] = int(message["need"])
+            except (KeyError, TypeError, ValueError):
+                return
+            self._voiceSyncMaybeDone()
+        elif kind == "vsync_apply":
+            try:
+                delayMs = max(0, min(3000, int(message.get("delay") or 0)))
+            except (TypeError, ValueError):
+                return
+            self._applyVoiceDelay(delayMs, str(message.get("mode") or ""))
+        elif kind == "vsync_cancel":
+            self.voiceSyncTimer.stop()
+            self.player.mediaPlayer.clearCues()
+            self.voiceSync = None
+            self.voiceSyncChanged.emit(None)
+            self.notify(f"{sync['partnerName']} ha annullato la sincronizzazione delle voci")
 
     # ---------- helpers ----------
     @staticmethod

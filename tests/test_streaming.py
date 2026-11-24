@@ -87,10 +87,17 @@ def test_playerLoadsStreamSongWithStartPosition(application, httpAudio):
     player.loadingChanged.connect(loadingStates.append)
     player.songLoaded.connect(loaded.append)
     player.restoreSession([song], 0, 2500)
+    # At startup the last song is only shown, paused at its point: nothing is decoded and nothing starts
+    application.processEvents()
+    assert not player.loading and not loaded and not player.isPlaying()
+    assert player.position() == 2500
+    assert player.mediaPlayer.source().isEmpty()
+    calls.clear()
+    player.togglePlay()
     assert player.loading
     assert waitFor(application, lambda: loaded)
     assert loadingStates == [True, False]
-    assert calls == [("https://www.youtube.com/watch?v=abcdefghijk", True)]
+    assert ("https://www.youtube.com/watch?v=abcdefghijk", True) in calls
     assert player.mediaPlayer.source().toString() == httpAudio
     assert player.mediaPlayer.sourceHeaders == {"User-Agent": "test"}
     assert waitFor(application, lambda: player.position() == 2500)
@@ -133,7 +140,11 @@ def test_togglePlayWhileLoadingDoesNotRestartResolve(application, httpAudio):
     player.togglePlay()
     assert player.loadAutoplay is False
     assert waitFor(application, lambda: not player.loading)
-    assert len(calls) == 1
+    # one look-up in advance at startup + the one of the load: toggling while loading adds none
+    assert waitFor(application, lambda: len(calls) == 2)
+    time.sleep(0.5)
+    application.processEvents()
+    assert len(calls) == 2
     player.shutdown()
 
 
@@ -364,7 +375,7 @@ def test_botCheckRetriesAnotherWay(monkeypatch):
     monkeypatch.setattr(downloader, "_runYoutube", fakeRun)
     info = downloader._withRetry(lambda: downloader._runYoutube({"format": "best"}, "https://youtu.be/abcdefghijk", False))
     assert info["url"].startswith("https://")
-    assert calls[0].get("source_address") == "0.0.0.0" and "extractor_args" not in calls[0]
+    assert calls[0].get("source_address") == "0.0.0.0" and "player_client" not in calls[0]["extractor_args"]["youtube"]
     assert calls[1]["extractor_args"]["youtube"]["player_client"] == downloader.BOT_CHECK_CLIENTS
     from app.player import _shortError
     assert "anti-bot" in _shortError("Sign in to confirm you're not a bot")

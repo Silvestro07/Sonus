@@ -23,6 +23,12 @@ def _replace_function(source, name, replacement):
     return "".join(lines)
 
 
+def _replace_required(source, old, new):
+    if old not in source:
+        raise ValueError(f"Android adaptation point missing: {old!r}")
+    return source.replace(old, new, 1)
+
+
 def _replace_imports(source):
     replacements = []
     for node in ast.walk(ast.parse(source)):
@@ -100,9 +106,9 @@ def adapt_source(name, source):
         ''')
     elif name == "audio_engine.py":
         source = source.replace("import sounddevice", "from sonus_mobile import android_audio as sounddevice")
-        source = source.replace("import numpy\n", "import numpy\nfrom sonus_mobile.android_audio import allocate_pcm\n", 1)
-        source = source.replace("numpy.zeros((self.estimatedFrames, CHANNELS), dtype=numpy.int16)", "allocate_pcm(self.estimatedFrames, CHANNELS)")
-        source = source.replace("numpy.zeros((max(len(buffer) * 2, decodedFrames + len(frames)), CHANNELS), dtype=numpy.int16)", "allocate_pcm(max(len(buffer) * 2, decodedFrames + len(frames)), CHANNELS)")
+        # Decoded audio uses the desktop PcmStore (5 s blocks, the rest spilled to app storage under
+        # TEMP_DIR/pcm); Android keeps less of it on the heap.
+        source = _replace_required(source, "PCM_RAM_SECONDS = 8 * 60", "PCM_RAM_SECONDS = 2 * 60")
         # A device can fail on the first write, before start() returns. Reset
         # before starting so the worker's completion flag cannot be overwritten.
         source = source.replace("            self.stream.start()\n            self.streamError = None", "            self.streamError = None\n            self.stream.start()")
@@ -124,7 +130,7 @@ def adapt_source(name, source):
                 self._cancelDecoder()
                 self._closeStream()
                 with self.lock:
-                    self.buffer = None
+                    self._dropBuffer()
                     self.decodedFrames = 0
         ''')
         # An allocation/decode failure must be reported to the owner thread.
@@ -136,7 +142,7 @@ def adapt_source(name, source):
         wrapper = '    def run(self):\n        try:\n' + textwrap.indent(body, "    ") + '\n        except Exception as error:\n            self._kill()\n            if not self.cancelled:\n                self.engine._decoderFailed(self.generation, str(error))\n'
         lines[run.lineno - 1:run.end_lineno] = [wrapper]
         source = "".join(lines)
-        source = source.replace('        if failMessage:\n            self._setStatus', '        if failMessage:\n            with self.lock:\n                self.buffer = None\n                self.decodedFrames = 0\n            self._setStatus')
+        source = _replace_required(source, '        if failMessage:\n            self._setStatus', '        if failMessage:\n            with self.lock:\n                self._dropBuffer()\n                self.decodedFrames = 0\n            self._setStatus')
         # Runtime disposal is the final resource boundary, including when
         # controller persistence raises (for example on full app storage).
         source += '\n    def _dispose(self):\n        self.shutdown()\n        super()._dispose()\n'

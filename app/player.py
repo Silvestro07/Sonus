@@ -36,6 +36,8 @@ def _forgetStream(target):
     forgetStream(target)
 
 REPEAT_OFF, REPEAT_ALL, REPEAT_ONE = 0, 1, 2
+# After this long in pause (or stopped) the decoded audio is dropped: it is loaded again, at the same point, on play
+IDLE_RELEASE_MS = 3 * 60 * 1000
 
 
 class Player(QObject):
@@ -87,6 +89,14 @@ class Player(QObject):
         self.skipOnError = True
         self.userActionAt = 0.0
         self.startPositionResolver = None
+        # Song shown in the bar but not loaded yet (restored at startup or released after a long pause):
+        # play loads it from this point
+        self.deferredPosition = None
+        self.idleTimer = QTimer(self)
+        self.idleTimer.setSingleShot(True)
+        self.idleTimer.setInterval(IDLE_RELEASE_MS)
+        self.idleTimer.timeout.connect(self.releaseIdleAudio)
+        self.keepLoaded = False  # True while something (a room) needs the song ready
 
         self.loopTimer = QTimer(self)
         self.loopTimer.setInterval(15)
@@ -108,6 +118,8 @@ class Player(QObject):
         return self.mediaPlayer.playbackState() == QMediaPlayer.PlayingState
 
     def position(self):
+        if self.deferredPosition is not None and self.mediaPlayer.source().isEmpty():
+            return self.deferredPosition
         return self.mediaPlayer.position()
 
     def duration(self):
@@ -223,6 +235,7 @@ class Player(QObject):
         song = self.currentSong()
         if song is None:
             return
+        self.deferredPosition = None
         self.setLoop(None)
         self.loadGeneration += 1
         if self.streamRetriedFor is not None and self.streamRetriedFor != song.get("id"):
@@ -340,11 +353,52 @@ class Player(QObject):
                 QTimer.singleShot(50, self.next)
 
     def restoreSession(self, songs, currentIndex, position):
+        """Shows the last song at the point where it was, paused. Nothing is decoded until play is pressed
+        (no memory used and nothing starts by itself); a streaming link is looked up in advance so play is quick."""
         self.queue = [dict(song) for song in songs]
         self.originalQueue = list(self.queue)
         self.currentIndex = currentIndex if 0 <= currentIndex < len(self.queue) else (0 if self.queue else -1)
         self.queueChanged.emit()
-        self._loadCurrent(autoplay=False, startPosition=position)
+        song = self.currentSong()
+        if song is None:
+            return
+        self._defer(song, max(0, int(position or 0)))
+        durationMs = int(float(song.get("duration") or 0) * 1000)
+        if durationMs:
+            self.mediaPlayer._setDuration(durationMs)
+        self.positionChanged.emit(self.deferredPosition)
+        self._prefetchTarget(song)
+
+    def _defer(self, song, position):
+        self.deferredPosition = position
+        self.songChanged.emit(song)
+
+    def _prefetchTarget(self, song):
+        if not song or not isStreamPath(song.get("path") or ""):
+            return
+        target = streamTarget(song["path"])
+        if target.startswith("roomfile:"):
+            return
+        runInBackground(self.streamResolver, target, True, pool=self.prefetchPool,
+                        onError=lambda message: print(f"[Stream] anticipo non riuscito: {_shortError(message)}"))
+
+    def isDeferred(self):
+        return self.deferredPosition is not None and self.mediaPlayer.source().isEmpty() and not self.loading
+
+    def releaseIdleAudio(self):
+        """Long pause: frees the decoded song (it can be hundreds of MB for long videos) and the sound card."""
+        song = self.currentSong()
+        if song is None or self.isPlaying() or self.loading or self.mediaPlayer.source().isEmpty():
+            return
+        if self.keepLoaded:
+            self.idleTimer.start()
+            return
+        position = self.mediaPlayer.position()
+        loop = self.activeLoop
+        self.mediaPlayer.releaseAudio()
+        self.deferredPosition = position
+        self.activeLoop = loop
+        print(f"[Audio] pausa lunga: liberata la memoria di {song.get('title')!r}")
 
     def _markUserAction(self):
         """Remembers that the person did something (play, pause, skip...): in a room only these are sent to
@@ -364,7 +418,7 @@ class Player(QObject):
             self.mediaPlayer.pause()
         else:
             if self.mediaPlayer.source().isEmpty():
-                self._loadCurrent(autoplay=True)
+                self._loadCurrent(autoplay=True, startPosition=self.deferredPosition or 0)
             else:
                 self.mediaPlayer.play()
 
@@ -416,6 +470,11 @@ class Player(QObject):
 
     def seek(self, positionMs):
         self._markUserAction()
+        if self.isDeferred():
+            self.deferredPosition = max(0, int(positionMs))
+            self.positionChanged.emit(self.deferredPosition)
+            self.seeked.emit(self.deferredPosition)
+            return
         self.mediaPlayer.setPosition(max(0, int(positionMs)))
         self.seeked.emit(max(0, int(positionMs)))
 
@@ -503,7 +562,12 @@ class Player(QObject):
         self.positionChanged.emit(position)
 
     def _onState(self, state):
-        self.playingChanged.emit(state == QMediaPlayer.PlayingState)
+        playing = state == QMediaPlayer.PlayingState
+        if playing:
+            self.idleTimer.stop()
+        else:
+            self.idleTimer.start()
+        self.playingChanged.emit(playing)
 
     def _onMediaStatus(self, status):
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia) and self.pendingSeek is not None:

@@ -1,4 +1,5 @@
 import collections
+import os
 import re
 import subprocess
 import sys
@@ -175,8 +176,17 @@ def applyBassBoostOffline(samples, amount):
     boosted = sosfilt(sos, samples, axis=0)
     peak = float(numpy.max(numpy.abs(boosted))) or 1.0
     return (boosted / max(1.0, peak / 0.98)).astype(numpy.float32)
-FADE_IN_SECONDS = 1.0
+# A long fade-in made every song feel like it started late: the first words were almost silent
+FADE_IN_SECONDS = 0.25
 FADE_OUT_SECONDS = 2.0
+# Decoded audio is kept in 5 s blocks (no giant buffer that is doubled and copied while it grows).
+# Up to PCM_RAM_SECONDS stay in memory, the rest of a long track (1 hour videos...) goes to a temporary file
+# that Windows keeps in its own cache: memory stays low however long the song is.
+PCM_CHUNK_FRAMES = SAMPLE_RATE * 5
+PCM_RAM_SECONDS = 8 * 60
+# Cues for "Sincronizza voci": a short click mixed into the same output as the music (same latency)
+CUE_SECONDS = 0.035
+CUE_FREQUENCY = 1760.0
 STREAM_CHUNK_BYTES = 10 * 1024 * 1024
 STREAM_READ_BYTES = 64 * 1024
 # YouTube's servers sometimes accept the connection and never answer: give up on that try quickly and ask again
@@ -197,6 +207,153 @@ def friendlyStreamError(message):
 
 def isRemote(path):
     return bool(path) and str(path).lower().startswith(("http://", "https://"))
+
+
+def _spillDirectory():
+    try:
+        from .config import TEMP_DIR
+        directory = os.path.join(TEMP_DIR, "pcm")
+    except Exception:
+        import tempfile
+        directory = os.path.join(tempfile.gettempdir(), "sonus_pcm")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def cleanupSpillFiles():
+    """Leftovers of a previous run (crash, forced close): nobody can be using them at startup."""
+    try:
+        directory = _spillDirectory()
+        for name in os.listdir(directory):
+            if name.startswith("decode_") and name.endswith(".pcm"):
+                try:
+                    os.remove(os.path.join(directory, name))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+class PcmStore:
+    """Decoded 16-bit stereo audio, growing while the decoder works and readable at any decoded frame.
+
+    Written by the decoder thread, read by the audio callback: `frames` only grows after the data is in place,
+    and readers never go past it. Old copies are never made while the track grows."""
+
+    def __init__(self, ramFrames=None):
+        self.lock = threading.Lock()
+        self.ramFrames = int(PCM_RAM_SECONDS * SAMPLE_RATE if ramFrames is None else ramFrames)
+        self.chunks = []  # ndarray (in memory) or file offset (int) of a full chunk
+        self.tail = numpy.zeros((PCM_CHUNK_FRAMES, CHANNELS), dtype=numpy.int16)
+        self.tailFrames = 0
+        self.frames = 0
+        self.file = None
+        self.filePath = None
+        self.fileBytes = 0
+        self.closed = False
+
+    def __len__(self):
+        return self.frames
+
+    def memoryBytes(self):
+        return sum(chunk.nbytes for chunk in self.chunks if not isinstance(chunk, int)) + self.tail.nbytes
+
+    def append(self, frames):
+        frames = numpy.ascontiguousarray(frames, dtype=numpy.int16).reshape(-1, CHANNELS)
+        offset = 0
+        while offset < len(frames):
+            with self.lock:
+                if self.closed:
+                    return False
+                take = min(PCM_CHUNK_FRAMES - self.tailFrames, len(frames) - offset)
+                self.tail[self.tailFrames:self.tailFrames + take] = frames[offset:offset + take]
+                self.tailFrames += take
+                offset += take
+                if self.tailFrames == PCM_CHUNK_FRAMES:
+                    self._commitTail()
+                self.frames += take
+        return True
+
+    def _commitTail(self):
+        """Lock held. Moves the full tail block to memory or, past the memory limit, to the spill file."""
+        if (len(self.chunks) + 1) * PCM_CHUNK_FRAMES <= self.ramFrames:
+            self.chunks.append(self.tail)
+        else:
+            if self.file is None:
+                import tempfile
+                descriptor, self.filePath = tempfile.mkstemp(prefix="decode_", suffix=".pcm", dir=_spillDirectory())
+                os.close(descriptor)
+                self.file = open(self.filePath, "r+b", buffering=0)
+            self.file.seek(self.fileBytes)
+            self.file.write(self.tail.tobytes())
+            self.chunks.append(self.fileBytes)
+            self.fileBytes += self.tail.nbytes
+            self.tail = numpy.empty((PCM_CHUNK_FRAMES, CHANNELS), dtype=numpy.int16)
+            self.tailFrames = 0
+            return
+        self.tail = numpy.empty((PCM_CHUNK_FRAMES, CHANNELS), dtype=numpy.int16)
+        self.tailFrames = 0
+
+    def read(self, start, count):
+        """int16 [count, 2] from frame `start` (the caller stays within `frames`)."""
+        output = numpy.empty((count, CHANNELS), dtype=numpy.int16)
+        with self.lock:
+            if self.closed:
+                output.fill(0)
+                return output
+            written = 0
+            position = start
+            while written < count:
+                chunkIndex, inside = divmod(position, PCM_CHUNK_FRAMES)
+                take = min(PCM_CHUNK_FRAMES - inside, count - written)
+                if chunkIndex < len(self.chunks):
+                    chunk = self.chunks[chunkIndex]
+                    if isinstance(chunk, int):
+                        self.file.seek(chunk + inside * 2 * CHANNELS)
+                        data = self.file.read(take * 2 * CHANNELS)
+                        part = numpy.frombuffer(data, dtype=numpy.int16).reshape(-1, CHANNELS)
+                        output[written:written + len(part)] = part
+                        if len(part) < take:
+                            output[written + len(part):written + take] = 0
+                    else:
+                        output[written:written + take] = chunk[inside:inside + take]
+                else:
+                    take = min(take, max(0, self.tailFrames - inside))
+                    if take <= 0:
+                        output[written:] = 0
+                        break
+                    output[written:written + take] = self.tail[inside:inside + take]
+                written += take
+                position += take
+        return output
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.chunks = []
+            self.tail = numpy.zeros((0, CHANNELS), dtype=numpy.int16)
+            if self.file is not None:
+                try:
+                    self.file.close()
+                except OSError:
+                    pass
+                self.file = None
+            if self.filePath:
+                try:
+                    os.remove(self.filePath)
+                except OSError:
+                    pass
+
+
+def makeCue(accent=False):
+    """Short click (sine with a fast decay) used by the voice synchronizer."""
+    length = int(CUE_SECONDS * SAMPLE_RATE)
+    times = numpy.arange(length) / SAMPLE_RATE
+    frequency = CUE_FREQUENCY * (1.5 if accent else 1.0)
+    tone = numpy.sin(2 * numpy.pi * frequency * times) * numpy.exp(-times / (CUE_SECONDS / 4))
+    return (numpy.repeat(tone[:, None], CHANNELS, axis=1) * 0.6).astype(numpy.float32)
 
 
 class _Decoder(threading.Thread):
@@ -233,28 +390,30 @@ class _Decoder(threading.Thread):
         self.feedError = None
         if remote:
             threading.Thread(target=self._feed, args=(self.process.stdin,), daemon=True).start()
-        buffer = numpy.zeros((self.estimatedFrames, CHANNELS), dtype=numpy.int16)
+        buffer = PcmStore()
         self.engine._attachBuffer(self.generation, buffer)
         frameBytes = 2 * CHANNELS
         decodedFrames = 0
         leftover = b""
         startedAt = time.time()
+        output = self.process.stdout
+        # read1 hands over what ffmpeg has written so far: the first sound plays after a few ms of audio,
+        # not after waiting for half a second of it
+        readSome = getattr(output, "read1", None) or output.read
         while not self.cancelled:
-            chunk = self.process.stdout.read(SAMPLE_RATE * frameBytes // 2)
+            chunk = readSome(SAMPLE_RATE * frameBytes // 2)
             if not chunk:
                 break
             chunk = leftover + chunk
             usable = len(chunk) - len(chunk) % frameBytes
             leftover = chunk[usable:]
+            if not usable:
+                continue
             frames = numpy.frombuffer(chunk[:usable], dtype=numpy.int16).reshape(-1, CHANNELS)
-            if decodedFrames + len(frames) > len(buffer):
-                newBuffer = numpy.zeros((max(len(buffer) * 2, decodedFrames + len(frames)), CHANNELS), dtype=numpy.int16)
-                newBuffer[:decodedFrames] = buffer[:decodedFrames]
-                buffer = newBuffer
-                self.engine._attachBuffer(self.generation, buffer)
-            buffer[decodedFrames:decodedFrames + len(frames)] = frames
-            if remote and decodedFrames == 0 and len(frames):
-                print(f"[Audio] primo audio dallo streaming dopo {time.time() - startedAt:.1f}s")
+            if not buffer.append(frames):
+                break
+            if decodedFrames == 0 and len(frames):
+                print(f"[Audio] primo audio {'dallo streaming ' if remote else ''}dopo {time.time() - startedAt:.2f}s")
             decodedFrames += len(frames)
             self.engine._setDecoded(self.generation, decodedFrames)
         if self.cancelled:
@@ -417,6 +576,8 @@ class AudioEngine(QObject):
         self.spectrumQueue = collections.deque(maxlen=32)
         self.spectrumLevels = [0.0] * SPECTRUM_BANDS
         self.bandEdges = {}
+        self.cues = []  # (time.time() when it must be heard, accent)
+        self.cueSounds = {False: makeCue(False), True: makeCue(True)}
 
         self.pollTimer = QTimer(self)
         self.pollTimer.setInterval(40)
@@ -427,11 +588,36 @@ class AudioEngine(QObject):
     def source(self):
         return self._source
 
+    def _dropBuffer(self):
+        """Lock held. Frees the decoded audio of the previous source right away (memory or spill file)."""
+        old = self.buffer
+        self.buffer = None
+        if old is not None and hasattr(old, "close"):
+            old.close()
+
+    def releaseAudio(self):
+        """Forgets the decoded audio and the source (e.g. after a long pause): the player loads it again on play."""
+        self._cancelDecoder()
+        with self.lock:
+            self.generation += 1
+            self._dropBuffer()
+            self.decodedFrames = 0
+            self.decodeDone = False
+            self.frame = 0
+            self.pendingSeekMs = None
+            self.pendingSeekAt = None
+        self._source = QUrl()
+        self._path = None
+        self._setState(QMediaPlayer.StoppedState)
+        self._setStatus(QMediaPlayer.NoMedia)
+        if not self.cues:
+            self._closeStream()
+
     def setSource(self, url):
         self._cancelDecoder()
         with self.lock:
             self.generation += 1
-            self.buffer = None
+            self._dropBuffer()
             self.decodedFrames = 0
             self.decodeDone = False
             self.frame = 0
@@ -578,7 +764,7 @@ class AudioEngine(QObject):
             self._cancelDecoder()
             with self.lock:
                 self.generation += 1
-                self.buffer = None
+                self._dropBuffer()
                 self.decodedFrames = 0
                 self.decodeDone = False
                 self.frame = 0
@@ -734,11 +920,7 @@ class AudioEngine(QObject):
             peak = float(magnitudes[start:end].max()) if end > start else 0.0
             decibels = 20 * numpy.log10(peak + 1e-9)
             levels.append(float(min(1.0, max(0.0, (decibels + 60) / 60))))
-        latency = OUTPUT_LATENCY
-        try:
-            latency = float(self.stream.latency) if self.stream is not None else OUTPUT_LATENCY
-        except Exception:
-            pass
+        latency = self.outputLatency()
         self.spectrumQueue.append((time.monotonic() + latency, levels))
 
     def spectrum(self):
@@ -786,6 +968,8 @@ class AudioEngine(QObject):
     def shutdown(self):
         self._cancelDecoder()
         self._closeStream()
+        with self.lock:
+            self._dropBuffer()
 
     def _readFrames(self, count):
         """Returns (frames float32 [count, 2], reachedEnd). Called with lock held."""
@@ -812,7 +996,8 @@ class AudioEngine(QObject):
                     endReached = True
                 break
             take = min(available, count - written)
-            output[written:written + take] = buffer[self.frame:self.frame + take].astype(numpy.float32) * (1.0 / 32768.0)
+            block = buffer.read(self.frame, take) if isinstance(buffer, PcmStore) else buffer[self.frame:self.frame + take]
+            output[written:written + take] = block.astype(numpy.float32) * (1.0 / 32768.0)
             written += take
             self.frame += take
             if self.loopFrames and self.frame >= self.loopFrames[1]:
@@ -820,6 +1005,11 @@ class AudioEngine(QObject):
         return output, endReached
 
     def _callback(self, outdata, frames, timeInfo, status):
+        self._render(outdata, frames)
+        if self.cues:
+            self._mixCues(outdata, frames)
+
+    def _render(self, outdata, frames):
         with self.lock:
             if self._state != QMediaPlayer.PlayingState or self.pendingSeekMs is not None and self.buffer is None:
                 outdata.fill(0)
@@ -861,6 +1051,46 @@ class AudioEngine(QObject):
                 samples[:, 1] *= min(1.0, 1.0 + self._balance)
             outdata[:] = _softLimit(samples).astype(numpy.float32)
 
+    # ---------- voice synchronizer cues ----------
+    def outputLatency(self):
+        """Seconds between a block being generated and being heard (as the sound card reports it)."""
+        try:
+            return float(self.stream.latency) if self.stream is not None else OUTPUT_LATENCY
+        except Exception:
+            return OUTPUT_LATENCY
+
+    def scheduleCues(self, times, accents=None):
+        """Clicks heard at the given wall-clock times (time.time() seconds), on top of the music if it plays."""
+        accents = list(accents or [False] * len(times))
+        with self.lock:
+            self.cues = sorted(self.cues + [(float(at), bool(accent)) for at, accent in zip(times, accents)])
+        return self._ensureStream()
+
+    def clearCues(self):
+        with self.lock:
+            self.cues = []
+
+    def _mixCues(self, outdata, frames):
+        latency = self.outputLatency()
+        # This block is heard `latency` seconds from now: a cue for time T starts at sample (T - now - latency)
+        blockStart = time.time() + latency
+        blockEnd = blockStart + frames / SAMPLE_RATE
+        with self.lock:
+            cues = list(self.cues)
+            self.cues = [cue for cue in cues if cue[0] + CUE_SECONDS >= blockEnd]
+        gain = 0.0 if self._muted else max(0.25, min(1.0, self._volume * 1.5))
+        for at, accent in cues:
+            if at + CUE_SECONDS < blockStart or at >= blockEnd:
+                continue
+            sound = self.cueSounds[accent]
+            offset = int(round((at - blockStart) * SAMPLE_RATE))
+            soundStart = max(0, -offset)
+            outStart = max(0, offset)
+            length = min(len(sound) - soundStart, frames - outStart)
+            if length > 0:
+                outdata[outStart:outStart + length] += sound[soundStart:soundStart + length] * gain
+        numpy.clip(outdata, -1.0, 1.0, out=outdata)
+
     # ---------- decoder callbacks (worker thread) ----------
     def _attachBuffer(self, generation, buffer):
         with self.lock:
@@ -868,6 +1098,9 @@ class AudioEngine(QObject):
                 self.buffer = buffer
                 if self.decodedFrames == 0:
                     self.pendingStatus.append(QMediaPlayer.LoadedMedia)
+                return
+        if hasattr(buffer, "close"):
+            buffer.close()
 
     def _setDecoded(self, generation, decodedFrames):
         with self.lock:

@@ -101,6 +101,7 @@ DEFAULT_SETTINGS = {
     "fxSongFade": True,
     "themeColors": {},
     "roomDelayMs": 0,
+    "roomPreciseSync": False,
     "effects": {},
     "videoFps": 0,
 }

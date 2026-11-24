@@ -285,6 +285,26 @@ class TogetherPopup(QFrame):
             delayHint.setWordWrap(True)
             layout.addWidget(delayHint)
             self._showDelay(self.controller.delayMs())
+            others = [(peerId, peer) for peerId, peer in self.controller.peers.items() if peerId != self.controller.myId()]
+            voiceButton = QPushButton("🎤  Sincronizza voci")
+            voiceButton.setObjectName("accent")
+            voiceButton.setToolTip("Per cantare insieme in chiamata: misura quanto in ritardo vi sentite e allinea le canzoni")
+            voiceButton.setEnabled(bool(others))
+            if len(others) == 1:
+                voiceButton.clicked.connect(lambda checked=False, peerId=others[0][0]: self._startVoiceSync(peerId))
+            elif others:
+                from PySide6.QtWidgets import QMenu
+                voiceMenu = QMenu(voiceButton)
+                for peerId, peer in others:
+                    voiceMenu.addAction(peer.get("name") or "Ospite", lambda peerId=peerId: self._startVoiceSync(peerId))
+                voiceButton.setMenu(voiceMenu)
+            layout.addWidget(voiceButton)
+            from PySide6.QtWidgets import QCheckBox
+            preciseCheck = QCheckBox("Sincronizzazione precisa (per cantare)")
+            preciseCheck.setToolTip("Tiene le canzoni allineate entro 0,12 s invece di 0,7 s (qualche piccolo salto in più)")
+            preciseCheck.setChecked(self.controller.preciseSync())
+            preciseCheck.toggled.connect(self.controller.setPreciseSync)
+            layout.addWidget(preciseCheck)
             leaveButton = QPushButton("Esci dalla stanza")
             leaveButton.clicked.connect(self.controller.leaveRoom)
             layout.addWidget(leaveButton)
@@ -298,6 +318,11 @@ class TogetherPopup(QFrame):
         self.adjustSize()
         if self.isVisible() and self.anchor is not None:
             self._place()
+
+    def _startVoiceSync(self, peerId):
+        if self.controller.startVoiceSync(peerId):
+            self.hide()
+            self.window.showVoiceSync()
 
     def _showDelay(self, delayMs):
         self.delayLabel.setText("Nessuno" if delayMs <= 0 else f"+{delayMs / 1000:.2f} s")

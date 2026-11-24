@@ -26,7 +26,9 @@ def test_fadeInAndOut():
     engine = AudioEngine()
     samples = numpy.ones((4096, 2), dtype=numpy.float32)
     faded = engine._applyFade(samples, 0)
-    assert faded[0, 0] == 0.0 and faded[-1, 0] < 0.1
+    assert faded[0, 0] == 0.0 and faded[-1, 0] < 0.45
+    # Short fade-in: the first words of a song are not swallowed
+    assert numpy.all(engine._applyFade(samples, int(SAMPLE_RATE * 0.3)) == 1.0)
     middle = engine._applyFade(samples, SAMPLE_RATE * 10)
     assert numpy.all(middle == 1.0)
     engine.decodeDone = True

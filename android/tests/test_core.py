@@ -165,18 +165,17 @@ class PortableCoreTests(unittest.TestCase):
         self.assertFalse(path.exists())
 
     def test_cancelled_decoder_cannot_reattach_storage_after_shutdown(self):
-        import gc
         from unittest.mock import patch
         from sonus_mobile.runtime import Runtime, QUrl
-        from sonus_mobile.android_audio import allocate_pcm
         from sonus_core import audio_engine
         allocating, release = threading.Event(), threading.Event()
         created = []
-        def delayed_allocate(frames, channels):
+        realStore = audio_engine.PcmStore
+        def delayed_store(*args, **kwargs):
             allocating.set()
             release.wait(2)
-            result = allocate_pcm(100, channels)
-            created.append(Path(result.filename))
+            result = realStore(*args, **kwargs)
+            created.append(result)
             return result
         class Process:
             def __init__(self, *args, **kwargs):
@@ -191,7 +190,7 @@ class PortableCoreTests(unittest.TestCase):
         runtime = Runtime().start()
         engine = runtime.call_sync(audio_engine.AudioEngine)
         try:
-            with patch.object(audio_engine, "ffmpegExe", return_value="ffmpeg"), patch.object(audio_engine.subprocess, "Popen", Process), patch.object(audio_engine, "allocate_pcm", delayed_allocate):
+            with patch.object(audio_engine, "ffmpegExe", return_value="ffmpeg"), patch.object(audio_engine.subprocess, "Popen", Process), patch.object(audio_engine, "PcmStore", delayed_store):
                 runtime.call_sync(engine.setSource, QUrl.fromLocalFile(str(self.root / "cancel.wav")))
                 self.assertTrue(allocating.wait(2))
                 decoder = engine.decoder
@@ -200,9 +199,9 @@ class PortableCoreTests(unittest.TestCase):
                 decoder.join(2)
                 self.assertFalse(decoder.is_alive())
                 self.assertIsNone(engine.buffer)
-                gc.collect()
                 self.assertTrue(created)
-                self.assertTrue(all(not path.exists() for path in created))
+                # the late storage was never attached and was released at once (no spill file left behind)
+                self.assertTrue(all(store.closed for store in created))
         finally:
             release.set()
             runtime.call_sync(engine.shutdown)

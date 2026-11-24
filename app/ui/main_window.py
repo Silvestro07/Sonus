@@ -240,6 +240,8 @@ class MainWindow(QMainWindow):
         self.together.effectsChanged.connect(self.playerBar.setEffectsIndicator)
         self.together.roomChanged.connect(self._updateTogetherUi)
         self.together.peersChanged.connect(self._updateTogetherUi)
+        self.together.voiceSyncChanged.connect(self._onVoiceSyncChanged)
+        self.voiceSyncDialog = None
         self.togetherPopup = None
         self.sharedPlaylists = SharedPlaylists(self.database, lambda text: self.showStatus(text, 4000), self)
         self.sharedPlaylists.playlistsChanged.connect(self._onSharedPlaylistChanged)
@@ -278,6 +280,23 @@ class MainWindow(QMainWindow):
         self._setupShortcuts()
         self._setupTray()
         self._restoreState()
+        # The last song is saved while you listen (not only when the app is closed with "Esci"): after a crash,
+        # a forced close or a Windows restart the app opens on it, paused where it was
+        self.sessionTimer = QTimer(self)
+        self.sessionTimer.setInterval(15000)
+        self.sessionTimer.timeout.connect(self._saveSession)
+        self.sessionTimer.start()
+        self.sessionSaveSoon = QTimer(self)
+        self.sessionSaveSoon.setSingleShot(True)
+        self.sessionSaveSoon.setInterval(1500)
+        self.sessionSaveSoon.timeout.connect(self._saveSession)
+        self.player.songChanged.connect(lambda song: self.sessionSaveSoon.start())
+        self.player.queueChanged.connect(self.sessionSaveSoon.start)
+        self.player.playingChanged.connect(lambda playing: self.sessionSaveSoon.start())
+        self.memoryTimer = QTimer(self)
+        self.memoryTimer.setInterval(60000)
+        self.memoryTimer.timeout.connect(self._trimMemory)
+        self.memoryTimer.start()
         self.refreshPlaylists()
         self.navigate("home")
         self._registerMediaKeys()
@@ -1357,6 +1376,7 @@ class MainWindow(QMainWindow):
             return
         self.videoRetried[key] = time.time()
         self.videoStreams.pop(key, None)
+        downloader.markVideoFailed(url)
         print("[Video] il link del video non va: ne cerco uno nuovo")
         QTimer.singleShot(0, self._refreshVideo)
 
@@ -1394,7 +1414,8 @@ class MainWindow(QMainWindow):
 
     def _updateVideoSuspend(self):
         inBackground = QApplication.instance().applicationState() != Qt.ApplicationActive
-        suspended = self.isMinimized() or (inBackground and bool(settings.get("pauseVideoInBackground")))
+        # Minimized or hidden in the tray nobody sees the video: it stops decoding (and is unloaded after a while)
+        suspended = self.isMinimized() or not self.isVisible() or (inBackground and bool(settings.get("pauseVideoInBackground")))
         self.videoController.setSuspended(suspended)
         if suspended:
             self.cursorTimer.stop()
@@ -2019,6 +2040,49 @@ class MainWindow(QMainWindow):
         self.rightPanel.setVisible(visible)
         self.playerBar.setPanelActive(visible)
 
+    def showVoiceSync(self):
+        from .voice_sync_dialog import VoiceSyncDialog
+        if self.voiceSyncDialog is None or not self.voiceSyncDialog.isVisible():
+            self.voiceSyncDialog = VoiceSyncDialog(self.together, self)
+        self.voiceSyncDialog.show()
+        self.voiceSyncDialog.raise_()
+        self.voiceSyncDialog.activateWindow()
+
+    def _onVoiceSyncChanged(self, sync):
+        """A friend started "Sincronizza voci": the window opens by itself (the countdown is already running)."""
+        if sync and sync.get("status") == "running" and (self.voiceSyncDialog is None or not self.voiceSyncDialog.isVisible()):
+            if self.isMinimized() or not self.isVisible():
+                self._showFromTray()
+            self.showVoiceSync()
+
+    def _saveSession(self):
+        current = self.player.currentSong()
+        if current is not None and current.get("_roomTrack") and not current.get("id"):
+            return
+        queueIds = [song["id"] for song in self.player.queue if song.get("id")][:2000]
+        values = {"lastQueue": queueIds, "lastSongId": current.get("id") if current else None,
+                  "lastPosition": int(self.player.position() or 0), "volume": self.player.volume,
+                  "muted": self.player.muted, "repeatMode": self.player.repeatMode, "shuffle": self.player.shuffle}
+        if all(settings.get(key) == value for key, value in values.items()):
+            return
+        for key, value in values.items():
+            settings.set(key, value)
+        settings.save()
+
+    def _trimMemory(self):
+        """Hidden in the tray or minimized and silent: give back to Windows the memory the app does not use now."""
+        if self.player.isPlaying() or (self.isVisible() and not self.isMinimized()):
+            return
+        import gc
+        gc.collect()
+        theme.trimCaches()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+            except Exception:
+                pass
+
     def closeEvent(self, event):
         if self.downloads.activeCount():
             answer = QMessageBox.question(self, APP_NAME, "Ci sono download in corso. Chiudere comunque?")
@@ -2035,9 +2099,9 @@ class MainWindow(QMainWindow):
         settings.set("muted", self.player.muted)
         settings.set("repeatMode", self.player.repeatMode)
         settings.set("shuffle", self.player.shuffle)
-        settings.set("lastQueue", [song["id"] for song in self.player.queue][:2000])
+        settings.set("lastQueue", [song["id"] for song in self.player.queue if song.get("id")][:2000])
         settings.set("lastSongId", current.get("id") if current else None)
-        settings.set("lastPosition", self.player.position())
+        settings.set("lastPosition", int(self.player.position() or 0))
         settings.save()
         if hasattr(self, "tray"):
             self.tray.hide()

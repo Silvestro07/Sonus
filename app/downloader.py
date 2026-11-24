@@ -59,8 +59,11 @@ def _baseOptions():
         options["js_runtimes"] = {"deno": {"path": denoPath}}
     if _ipv4Works:
         options["source_address"] = "0.0.0.0"
+    # The HLS/DASH manifests are two more downloads per song and the formats Sonus uses are not in them
+    youtubeArgs = {"skip": ["hls", "dash", "translated_subs"]}
     if time.time() < _botCheckUntil:
-        options["extractor_args"] = {"youtube": {"player_client": list(BOT_CHECK_CLIENTS)}}
+        youtubeArgs["player_client"] = list(BOT_CHECK_CLIENTS)
+    options["extractor_args"] = {"youtube": youtubeArgs}
     return options
 
 
@@ -137,8 +140,71 @@ def searchYoutube(query, maxResults=25):
 
 
 STREAM_CACHE_SECONDS = 4 * 3600
+# YouTube links stay valid ~6 hours (the `expire` in the link): a link is reused until 20 minutes before that
+STREAM_EXPIRY_MARGIN = 20 * 60
+STREAM_CACHE_LIMIT = 300
 _streamCache = {}
 _streamCacheLock = threading.Lock()
+_streamCacheLoaded = False
+
+
+def _streamCachePath():
+    from .config import DATA_DIR
+    return os.path.join(DATA_DIR, "stream_cache.json")
+
+
+def _linkExpiry(url, foundAt):
+    match = re.search(r"[?&/]expire[=/](\d{9,11})", url or "")
+    if match:
+        return int(match.group(1)) - STREAM_EXPIRY_MARGIN
+    return foundAt + STREAM_CACHE_SECONDS
+
+
+def _cacheValid(cached):
+    if not cached:
+        return False
+    foundAt, result = cached
+    return time.time() < min(foundAt + STREAM_CACHE_SECONDS * 2, _linkExpiry(result.get("url"), foundAt))
+
+
+def _loadStreamCache():
+    """Links found in the last hours (also by the previous run of the app): the song starts without asking YouTube."""
+    global _streamCacheLoaded
+    if _streamCacheLoaded:
+        return
+    _streamCacheLoaded = True
+    try:
+        import json
+        with open(_streamCachePath(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        for target, (foundAt, result) in saved.items():
+            if _cacheValid((foundAt, result)) and target not in _streamCache:
+                _streamCache[target] = (float(foundAt), dict(result))
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _saveStreamCache():
+    import json
+    with _streamCacheLock:
+        items = [(target, cached) for target, cached in _streamCache.items()
+                 if _cacheValid(cached) and not str(target).startswith("roomfile:")]
+    items = items[-STREAM_CACHE_LIMIT:]
+    try:
+        with open(_streamCachePath() + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump({target: [cached[0], cached[1]] for target, cached in items}, handle)
+        os.replace(_streamCachePath() + ".tmp", _streamCachePath())
+    except OSError:
+        pass
+
+
+def cachedStream(target):
+    """The link already found for this song, if it is still valid (no network)."""
+    target = (target or "").strip()
+    with _streamCacheLock:
+        _loadStreamCache()
+        cached = _streamCache.get(target)
+    return dict(cached[1]) if _cacheValid(cached) else None
 
 
 _resolveLocks = {}
@@ -202,19 +268,42 @@ def _rememberMatch(query, videoUrl):
             pass
 
 
+# Ready yt-dlp instances, shared by all worker threads (one thread at a time each): YouTube's player and its
+# solved challenges stay in memory, so after the first song the next ones are found much faster. Worker threads
+# end after 30 s idle; keeping the instances here (not per thread) means they are not lost with the thread.
+_youtubeIdle = []
+_youtubeIdleLock = threading.Lock()
+YOUTUBE_IDLE_KEEP = 3
+
+
 def _youtube():
-    """One yt-dlp per worker thread, kept alive: YouTube's player and its solved challenges stay in memory,
-    so after the first song the next ones are found much faster."""
     import yt_dlp
     mode = (time.time() < _botCheckUntil, _ipv4Works)
     instance = getattr(_threadLocal, "youtube", None)
-    if instance is None or getattr(_threadLocal, "mode", None) != mode:
+    if instance is not None and getattr(_threadLocal, "mode", None) == mode:
+        return instance
+    with _youtubeIdleLock:
+        while _youtubeIdle:
+            candidate, candidateMode = _youtubeIdle.pop()
+            if candidateMode == mode:
+                instance = candidate
+                break
+    if instance is None:
         options = _baseOptions()
         options.update({"format": "bestaudio[ext=m4a]/bestaudio/best", "noplaylist": True})
         instance = yt_dlp.YoutubeDL(options)
-        _threadLocal.youtube = instance
-        _threadLocal.mode = mode
+    _threadLocal.youtube = instance
+    _threadLocal.mode = mode
     return instance
+
+
+def _releaseYoutube():
+    instance = getattr(_threadLocal, "youtube", None)
+    _threadLocal.youtube = None
+    if instance is not None:
+        with _youtubeIdleLock:
+            if len(_youtubeIdle) < YOUTUBE_IDLE_KEEP:
+                _youtubeIdle.append((instance, getattr(_threadLocal, "mode", None)))
 
 
 def _extractOnce(target):
@@ -226,18 +315,21 @@ def _extractOnce(target):
 
 
 def _extract(target):
-    return _withRetry(lambda: _extractOnce(target))
+    try:
+        return _withRetry(lambda: _extractOnce(target))
+    finally:
+        _releaseYoutube()
 
 
 def _resolveStreamLocked(target, useCache):
     startedAt = time.time()
-    if not (useCache and _streamCache.get(target)):
-        print(f"[Stream] cerco su YouTube: {target[:80]!r}")
     if useCache:
         with _streamCacheLock:
+            _loadStreamCache()
             cached = _streamCache.get(target)
-        if cached and time.time() - cached[0] < STREAM_CACHE_SECONDS:
+        if _cacheValid(cached):
             return dict(cached[1])
+    print(f"[Stream] cerco su YouTube: {target[:80]!r}")
     isSearch = target.lower().startswith("ytsearch")
     info = None
     knownUrl = knownVideoUrl(target) if isSearch else None
@@ -267,12 +359,19 @@ def _resolveStreamLocked(target, useCache):
         "duration": float(info.get("duration") or 0),
         "title": info.get("title") or "",
         "webpageUrl": info.get("webpage_url") or (target if isUrl(target) else ""),
+        # The video formats come in the same answer: the background video needs no second YouTube lookup
+        "videos": _videoFormats(info),
     }
     fast_net.warmUrl(streamUrl)
     if isSearch and isUrl(result["webpageUrl"]):
         _rememberMatch(target, result["webpageUrl"])
     with _streamCacheLock:
         _streamCache[target] = (time.time(), dict(result))
+        if result["webpageUrl"] and result["webpageUrl"] != target:
+            _streamCache[result["webpageUrl"]] = (time.time(), dict(result))
+        while len(_streamCache) > STREAM_CACHE_LIMIT:
+            _streamCache.pop(next(iter(_streamCache)))
+    threading.Thread(target=_saveStreamCache, daemon=True).start()
     print(f"[Stream] trovato in {time.time() - startedAt:.1f}s: {result['title'][:60]!r}")
     return result
 
@@ -291,8 +390,62 @@ def videoHeaders(url):
     return dict(_videoHeaders.get(url) or {})
 
 
+def _videoFormats(info):
+    """Video-only (or muxed) mp4 formats of a yt-dlp answer, smallest first: {height, url, headers, avc}."""
+    formats = []
+    for item in info.get("formats") or []:
+        url = item.get("url")
+        height = item.get("height")
+        if not url or not height or item.get("vcodec") in (None, "none") or item.get("protocol") not in ("https", "http"):
+            continue
+        if item.get("ext") != "mp4":
+            continue
+        formats.append({"height": int(height), "url": url, "headers": dict(item.get("http_headers") or info.get("http_headers") or {}),
+                        "avc": str(item.get("vcodec") or "").startswith("avc1"), "fps": item.get("fps") or 0})
+    formats.sort(key=lambda item: (item["height"], item["avc"]))
+    return formats
+
+
+_failedVideos = set()
+
+
+def markVideoFailed(url):
+    """A video link that YouTube refused: the next lookup asks YouTube instead of reusing it."""
+    if url:
+        with _streamCacheLock:
+            _failedVideos.add(url)
+
+
+def _pickVideo(formats, height):
+    fitting = [item for item in formats if item["height"] <= height and item["url"] not in _failedVideos]
+    if not fitting:
+        return None
+    best = max(item["height"] for item in fitting)
+    candidates = [item for item in fitting if item["height"] == best]
+    return next((item for item in candidates if item["avc"]), candidates[0])
+
+
+def _videoFromCache(target, height):
+    with _streamCacheLock:
+        _loadStreamCache()
+        cached = _streamCache.get(target.strip())
+    if not _cacheValid(cached):
+        return None
+    return _pickVideo(cached[1].get("videos") or [], height)
+
+
 def resolveVideoStream(target, height=720):
     """Direct URL of the song's video (no audio needed: the app plays it muted) at the chosen quality."""
+    target = target.strip()
+    # The song's audio is usually being looked up right now: wait for it and take the video from the same answer
+    with _streamCacheLock:
+        lock = _resolveLocks.setdefault(target, threading.Lock())
+    with lock:
+        chosen = _videoFromCache(target, height)
+    if chosen is not None:
+        with _streamCacheLock:
+            _videoHeaders[chosen["url"]] = dict(chosen["headers"])
+        return chosen["url"]
     options = _baseOptions()
     options.update({
         "format": (f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]/bestvideo[height<={height}][ext=mp4]/"

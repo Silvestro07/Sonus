@@ -229,7 +229,33 @@ def icon(name, color=TEXT, size=20):
     return result
 
 
-_pixmapCache = {}
+class _PixmapCache(dict):
+    """Covers already scaled and rounded, most recently used last: the oldest go when there are too many."""
+
+    LIMIT = 600
+
+    def __getitem__(self, key):
+        value = dict.pop(self, key)
+        dict.__setitem__(self, key, value)
+        return value
+
+    def __setitem__(self, key, value):
+        if key in self:
+            dict.pop(self, key)
+        dict.__setitem__(self, key, value)
+        while len(self) > self.LIMIT:
+            dict.pop(self, next(iter(self)))
+
+
+_pixmapCache = _PixmapCache()
+
+
+def trimCaches():
+    """Keeps only the small, recently used covers (the app is hidden: the big ones are made again when shown)."""
+    for key in list(_pixmapCache):
+        pixmap = dict.get(_pixmapCache, key)
+        if pixmap is not None and pixmap.width() * pixmap.height() > 160 * 160:
+            dict.pop(_pixmapCache, key, None)
 
 _PLACEHOLDER_COLORS = [
     ("#450AF5", "#8E8EE5"), ("#1E3264", "#4F7BD6"), ("#8C1932", "#E8115B"), ("#056952", "#27856A"),
