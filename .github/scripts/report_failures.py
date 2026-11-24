@@ -16,6 +16,14 @@ for pattern in sys.argv[1:]:
                 text = (problem.get("message") or "") + "\n" + (problem.text or "")
                 text = text.strip()[-1500:].replace("%", "%25").replace("\r", "").replace("\n", "%0A")
                 print(f"::error title={name}::{text}")
+                output = "
+".join(part.text or "" for part in case.findall("system-out") + case.findall("system-err"))
+                lines = [line for line in output.splitlines() if line.strip()]
+                if lines:
+                    tail = "
+".join(lines[-40:])[-3000:].replace("%", "%25").replace("", "").replace("
+", "%0A")
+                    print(f"::warning title=Output di {name}::{tail}")
                 shown += 1
                 if shown >= 9:
                     sys.exit(0)

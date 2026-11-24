@@ -32,7 +32,7 @@ jobs:
         env:
           PYTHONPATH: android/app/src/main/python:android/app/build/generated/python
         run: |
-          python -m pytest android/tests -q --junitxml=android/app/build/core-tests.xml
+          python -m pytest android/tests -q --junitxml=android/app/build/core-tests.xml -o junit_logging=all
           python -m pytest android/tests -q --basetemp=android/app/build/pytest-repeat
       - name: Mostra i test falliti
         if: failure()
