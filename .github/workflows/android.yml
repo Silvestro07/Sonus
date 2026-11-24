@@ -34,6 +34,9 @@ jobs:
         run: |
           python -m pytest android/tests -q --junitxml=android/app/build/core-tests.xml
           python -m pytest android/tests -q --basetemp=android/app/build/pytest-repeat
+      - name: Mostra i test falliti
+        if: failure()
+        run: python .github/scripts/report_failures.py 'android/app/build/*tests.xml'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -43,6 +46,8 @@ jobs:
   android:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -58,6 +63,15 @@ jobs:
         env:
           SONUS_BUILD_PYTHON: ${{ steps.python.outputs.python-path }}
         run: bash ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug assembleDebugAndroidTest
+      - name: Pubblica l'APK di prova nelle Releases
+        if: github.ref == 'refs/heads/Android-Sonus'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk=$(ls android/app/build/outputs/apk/debug/*.apk | head -n 1)
+          cp "$apk" Sonus-Android-Sonus.apk
+          gh release delete android-sonus-test --yes --cleanup-tag || true
+          gh release create android-sonus-test Sonus-Android-Sonus.apk --prerelease --target "$GITHUB_SHA"             --title "Sonus Android — prova (branch Android-Sonus)"             --notes "APK di prova creato automaticamente dall'ultimo commit di Android-Sonus ($GITHUB_SHA). Se hai già installato un Sonus Android, disinstallalo prima: ogni build è firmata con una chiave di debug diversa."
       - name: Abilita accelerazione dell'emulatore nel runner temporaneo
         run: sudo chown "$USER" /dev/kvm
       - name: Prove su Android 15
@@ -72,6 +86,9 @@ jobs:
           disable-animations: true
           working-directory: android
           script: bash ./gradlew --no-daemon connectedDebugAndroidTest
+      - name: Mostra i test falliti
+        if: failure()
+        run: python .github/scripts/report_failures.py 'android/app/build/outputs/androidTest-results/**/*.xml' 'android/app/build/test-results/**/*.xml'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
