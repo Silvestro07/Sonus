@@ -56,6 +56,9 @@ private data class FormSpec(val title: String, val fields: List<Pair<String, Str
     LaunchedEffect(state.opt("messageId")) { state.str("message").takeIf { it.isNotBlank() }?.let { snack.showSnackbar(it) } }
     LaunchedEffect(route, state.obj("settings").flag("fxTransitions", true)) { if (state.obj("settings").flag("fxTransitions", true)) { pageOpacity.snapTo(.3f); pageOpacity.animateTo(1f, tween(160)) } else pageOpacity.snapTo(1f) }
     LaunchedEffect(form) { formError = "" }
+    // A friend started "Sincronizza voci": open the room page (the countdown is already running)
+    val voiceSession = state.obj("room").optJSONObject("voiceSync")?.takeIf { it.str("status") == "running" }?.str("session")
+    LaunchedEffect(voiceSession) { if (voiceSession != null && route != "Stanza") go("Stanza") }
 
     Scaffold(containerColor = MaterialTheme.colorScheme.background, snackbarHost = { SnackbarHost(snack) }, topBar = {
         CenterAlignedTopAppBar(title = { Text(if (route == "Playlist") playlists.find { it.int("id") == playlistId }?.str("name") ?: "Playlist" else if (route == "Player") "In riproduzione" else route, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold) },

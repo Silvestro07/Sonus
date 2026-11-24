@@ -194,3 +194,19 @@ application dependency (Paho is already used by the original core).
 Real phone audio/Bluetooth/background lifecycle, live providers,
 MQTT participants on separate PC/Android devices and very long exports still require
 their corresponding device/network validation; these unit tests do not claim it.
+
+## Voice synchronizer (Sincronizza voci)
+
+| Action | Payload |
+| --- | --- |
+| `voice_sync_start` | `peer` (room peer id); starts the 3-step measure with that friend |
+| `voice_sync_tap` | optional `at` (device wall clock ms, `System.currentTimeMillis()` at the touch) |
+| `voice_sync_apply` | `mode`: `me` (I hear the friend in time), `them`, `half` |
+| `voice_sync_cancel` | Empty; also tells the friend |
+| `room_precise` | `value`: room drift tolerance 120 ms instead of 700 ms |
+
+`room.voiceSync` is null or `{session, partner, partnerName, initiator, beatMs, status, phases:[{role, beats}],
+taps, myNeed, theirNeed, error, applied, choices?}`. `status`: `running` → `waiting` → `done` → `applied`, or
+`failed`. Roles: `click` (my app ticks, I tap with it), `sing` (my app ticks, I say "ta", taps ignored),
+`listen` (no ticks, I tap with the friend's voice). Beat times are on this device's wall clock.
+`room.precise` reflects the precise sync flag. Restored sessions are shown paused and decoded only on play.

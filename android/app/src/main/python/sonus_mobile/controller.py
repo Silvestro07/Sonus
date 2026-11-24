@@ -88,7 +88,7 @@ class Controller:
                        self.player.modesChanged, self.player.volumeChanged, self.player.loopChanged,
                        self.player.durationChanged, self.together.roomChanged, self.together.peersChanged,
                        self.together.connectionChanged, self.together.effectsChanged,
-                       self.shared.playlistsChanged):
+                       self.together.voiceSyncChanged, self.shared.playlistsChanged):
             signal.connect(lambda *_: self._dirty())
         self._apply_eq()
         self._apply_effects(self.song_effects())
@@ -257,7 +257,8 @@ class Controller:
                           "peers": [dict(peer, id=peer_id) for peer_id, peer in self.together.otherPeers().items()], "delayMs": self.together.delayMs(),
                           "link": linkFor(self.together.code) if self.together.code else None,
                           "broker": self.together.link.brokerName(),
-                          "error": getattr(self.together.link, "lastError", "")},
+                          "error": getattr(self.together.link, "lastError", ""),
+                          "precise": self.together.preciseSync(), "voiceSync": self._voice_sync_snapshot()},
                  "profile": self.together.profile(), "search": dict(self.search), "discover": self.discover,
                  "lyricsResults": self.lyrics_results, "lyricsPending": list(self._lyrics_pending),
                  "videoResults": self.video_results, "video": dict(self.video),
@@ -268,6 +269,21 @@ class Controller:
                  "update": self.update, "diagnostics": self.diagnostics_text, "exportPath": self.export_path})
         # Make detached objects: the host and queued callbacks must not see later mutations.
         return json.loads(json.dumps(state, ensure_ascii=False)) if detached else state
+
+    def _voice_sync_snapshot(self):
+        """Voice synchronizer for the UI: phases with beat times (device wall clock ms) and my role in each."""
+        sync = self.together.voiceSync
+        if not sync:
+            return None
+        from sonus_core import voice_sync
+        result = {key: sync.get(key) for key in ("session", "partner", "partnerName", "initiator", "beatMs", "status",
+                                                  "myNeed", "theirNeed", "error", "applied")}
+        result["phases"] = [{"role": phase["role"], "beats": list(phase["beats"])} for phase in sync["phases"]]
+        result["taps"] = len(sync.get("taps") or [])
+        if sync.get("status") == "done":
+            result["choices"] = [{"mode": mode, "late": list(voice_sync.mismatch(mode, sync["myNeed"], sync["theirNeed"]))}
+                                 for mode in (voice_sync.MODE_ME, voice_sync.MODE_THEM, voice_sync.MODE_HALF)]
+        return result
 
     def dispatch(self, action, payload=None):
         if self.closed:
@@ -468,6 +484,18 @@ class Controller:
             self._apply_effects(self.song_effects())
         elif action == "room_delay":
             self.together.setDelay(p["value"])
+        elif action == "room_precise":
+            self.together.setPreciseSync(bool(p.get("value")))
+        elif action == "voice_sync_start":
+            if not self.together.startVoiceSync(str(p.get("peer") or "")):
+                raise ValueError("Amico non trovato nella stanza")
+        elif action == "voice_sync_tap":
+            self.together.voiceSyncTap(int(p["at"]) if p.get("at") is not None else None)
+        elif action == "voice_sync_apply":
+            if self.together.applyVoiceSync(str(p.get("mode") or "me")) is None:
+                raise ValueError("Misura non ancora pronta")
+        elif action == "voice_sync_cancel":
+            self.together.cancelVoiceSync(notifyPartner=True)
         elif action == "profile":
             self._profile(p)
         elif action == "settings":

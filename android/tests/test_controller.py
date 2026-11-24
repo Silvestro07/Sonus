@@ -691,3 +691,37 @@ def test_two_controllers_over_real_local_mqtt(mobile, real_audio, monkeypatch):
         runtime.call_sync(controller.shared.stopAll)
         broker.terminate()
         broker.wait(5)
+
+
+def test_voice_sync_actions_and_snapshot(mobile):
+    runtime, controller, _, _ = mobile
+    act(mobile, "voice_sync_start", peer="nobody")
+    assert snap(mobile)["error"]["action"] == "voice_sync_start"
+    assert snap(mobile)["room"]["voiceSync"] is None and snap(mobile)["room"]["precise"] is False
+    sent = []
+    def fake_room():
+        controller.together.code = "SONUS-TEST"
+        controller.together.peers = {"friend": {"id": "friend", "name": "Amico"}}
+        controller.together.link.publish = lambda code, topic, payload, retain=False: sent.append(payload)
+        controller.player.mediaPlayer.scheduleCues = lambda times, accents=None: True
+    runtime.call_sync(fake_room)
+    act(mobile, "voice_sync_start", peer="friend")
+    sync = snap(mobile)["room"]["voiceSync"]
+    assert sync["status"] == "running" and [phase["role"] for phase in sync["phases"]] == ["click", "sing", "listen"]
+    assert sent[0]["type"] == "vsync_invite"
+    for role, offset in (("click", 30), ("listen", 210)):
+        phase = next(item for item in sync["phases"] if item["role"] == role)
+        for beat in phase["beats"]:
+            act(mobile, "voice_sync_tap", at=beat + offset)
+    runtime.call_sync(controller.together._finishVoiceSyncTaps)
+    assert snap(mobile)["room"]["voiceSync"]["myNeed"] == 180
+    runtime.call_sync(lambda: controller.together._onVoiceSyncMessage(
+        {"type": "vsync_result", "from": "friend", "to": controller.together.myId(), "session": sync["session"], "need": 100}))
+    done = snap(mobile)["room"]["voiceSync"]
+    assert done["status"] == "done" and [choice["mode"] for choice in done["choices"]] == ["me", "them", "half"]
+    act(mobile, "voice_sync_apply", mode="half")
+    assert snap(mobile)["room"]["delayMs"] == 40 and snap(mobile)["room"]["precise"] is True
+    act(mobile, "room_precise", value=False)
+    act(mobile, "voice_sync_cancel")
+    assert snap(mobile)["room"]["voiceSync"] is None
+    runtime.call_sync(lambda: setattr(controller.together, "code", None))

@@ -2,7 +2,7 @@ name: Android — build e prove complete
 
 on:
   push:
-    branches: [android]
+    branches: [android, Android-Sonus]
   workflow_dispatch:
 
 permissions:

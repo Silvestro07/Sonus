@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -98,9 +99,15 @@ import java.io.File
         Action("Condividi invito") { share(room.str("link", "sonus://join/${room.str("code")}")) }
         Text("Nella stanza", style = MaterialTheme.typography.titleLarge)
         val peers = room.list("peers")
-        peers.forEach { peer -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { Text("◉"); Text(peer.str("name", peer.str("id", "Amico"))) } }
+        room.optJSONObject("voiceSync")?.let { VoiceSyncPanel(it, send) }
+        peers.forEach { peer -> Row(Modifier.fillMaxWidth().heightIn(min = 56.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("◉", color = MaterialTheme.colorScheme.primary); Text(peer.str("name", peer.str("id", "Amico")), Modifier.weight(1f))
+            FilledTonalButton(onClick = { send("voice_sync_start", json("peer" to peer.str("id"))) }, enabled = room.optJSONObject("voiceSync") == null) { Text("🎤 Sincronizza voci") }
+        } }
         Text("${peers.size + 1} partecipanti", color = MaterialTheme.colorScheme.onSurfaceVariant)
         ValueSlider("Ritardo personale", room.num("delayMs").toFloat(), 0f..3000f, "${room.int("delayMs")} ms") { send("room_delay", json("value" to it.toInt())) }
+        Text("Vale solo per te: se in chiamata senti gli altri in ritardo, aumentalo finché la musica combacia (o usa Sincronizza voci).", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        ToggleRow("Sincronizzazione precisa (per cantare)", room.flag("precise")) { send("room_precise", json("value" to it)) }
         Action("Esci dalla stanza") { send("room_leave", json()) }
     }
     Action("Modifica profilo", true, profile)

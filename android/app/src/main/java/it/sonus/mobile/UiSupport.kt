@@ -8,7 +8,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -32,14 +34,31 @@ typealias Send = (String, JSONObject) -> Unit
 @Composable fun SonusTheme(settings: JSONObject = JSONObject(), content: @Composable () -> Unit) {
     val colors = settings.obj("themeColors")
     fun color(key: String, fallback: String) = runCatching { Color(android.graphics.Color.parseColor(colors.str(key, fallback))) }.getOrDefault(Color(android.graphics.Color.parseColor(fallback)))
-    MaterialTheme(colorScheme = darkColorScheme(primary = color("accent", "#1ED760"), onPrimary = Color(0xFF07140A), background = color("background", "#090B0E"), surface = color("panel", "#15191E"), surfaceVariant = color("sidebar", "#21262D"), onSurface = color("text", "#F5F7F8"), onBackground = color("text", "#F5F7F8"), onSurfaceVariant = Color(0xFFA5ADB8)), content = content)
+    // Same palette as the PC app (app/ui/theme.py: DEFAULT_COLORS and the derived ELEVATED/SUBTEXT tones)
+    val accent = color("accent", "#1ED760")
+    val background = color("background", "#121212")
+    val panel = color("panel", "#181818")
+    val text = color("text", "#FFFFFF")
+    val onAccent = if (accent.luminance() > 0.45f) Color.Black else Color.White
+    MaterialTheme(colorScheme = darkColorScheme(primary = accent, onPrimary = onAccent, secondaryContainer = mix(panel, text, .10f), onSecondaryContainer = text,
+        background = background, surface = panel, surfaceVariant = mix(panel, text, .07f), surfaceContainer = panel, surfaceContainerHigh = mix(panel, text, .07f),
+        onSurface = text, onBackground = text, onSurfaceVariant = mix(text, background, .30f), outline = mix(background, text, .10f)), content = content)
 }
+
+fun mix(first: Color, second: Color, amount: Float) = Color(
+    first.red + (second.red - first.red) * amount, first.green + (second.green - first.green) * amount,
+    first.blue + (second.blue - first.blue) * amount, 1f)
+
+// Placeholder covers of the PC app (theme.placeholderCover): gradient + music note, chosen by the song id
+private val PLACEHOLDER_COLORS = listOf(0xFF450AF5 to 0xFF8E8EE5, 0xFF1E3264 to 0xFF4F7BD6, 0xFF8C1932 to 0xFFE8115B, 0xFF056952 to 0xFF27856A,
+    0xFFBA5D07 to 0xFFF59B23, 0xFF503750 to 0xFFAF2896, 0xFF283C46 to 0xFF477D95, 0xFF7D4B32 to 0xFFD84000)
 
 @Composable fun Artwork(song: JSONObject, modifier: Modifier = Modifier.size(52.dp)) {
     val cover = song.str("cover").ifEmpty { song.str("image").ifEmpty { song.str("thumbnail") } }
-    Box(modifier.clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
+    val (start, end) = PLACEHOLDER_COLORS[Math.floorMod(song.optInt("id", 0), PLACEHOLDER_COLORS.size)]
+    Box(modifier.clip(RoundedCornerShape(4.dp)).background(Brush.linearGradient(listOf(Color(start), Color(end)))), contentAlignment = Alignment.Center) {
         if (cover.isNotEmpty()) AsyncImage(model = if (cover.startsWith("http")) cover else File(cover), contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-        else Text("♫", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.headlineMedium)
+        else Text("♫", color = Color.White.copy(alpha = .85f), style = MaterialTheme.typography.headlineMedium)
     }
 }
 
